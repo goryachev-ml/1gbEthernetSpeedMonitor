@@ -39,7 +39,13 @@ param(
     [bool]$ForceGigabit = $true,
 
     # Файл лога.
-    [string]$LogPath = (Join-Path $PSScriptRoot "1gbEthernetSpeedMonitor.log")
+    [string]$LogPath = (Join-Path $PSScriptRoot "1gbEthernetSpeedMonitor.log"),
+
+    # Таймаут на вызовы Get-NetAdapter/Restart-NetAdapter, сек. Защита от
+    # "зависания" WMI-провайдера сетевого адаптера (после серии быстрых
+    # перезапусков он иногда перестаёт отвечать, и вызов без таймаута
+    # мог бы заблокировать цикл мониторинга навсегда без единой записи в лог).
+    [int]$CmdletTimeoutSeconds = 20
 )
 
 # Определение языка системы: русский - если язык интерфейса ОС русский,
@@ -64,6 +70,7 @@ $Messages = @{
         AfterForcedSet        = "После принудительной установки: скорость {0}, статус {1}."
         RestartError          = "Ошибка при Restart-NetAdapter: {0}"
         PollError             = "Ошибка при опросе адаптера '{0}': {1}"
+        CmdletTimeout         = "Команда не ответила за {0} сек (похоже, завис сетевой провайдер) - прерываю и повторю попытку на следующей итерации."
         NoSpeedDuplexProperty = "У адаптера '{0}' не найдено свойство 'Speed & Duplex' - драйвер не поддерживает принудительную установку скорости."
         NoNonAutoValues       = "У свойства '{0}' нет значений, кроме автосогласования - принудительная установка невозможна."
         AlreadyMax            = "Свойство '{0}' уже установлено в максимальное значение '{1}' - принудительная установка не требуется."
@@ -87,6 +94,7 @@ $Messages = @{
         AfterForcedSet        = "After forced setting: speed {0}, status {1}."
         RestartError          = "Error during Restart-NetAdapter: {0}"
         PollError             = "Error polling adapter '{0}': {1}"
+        CmdletTimeout         = "Command did not respond within {0} sec (the network provider appears to be stuck) - aborting and will retry on the next iteration."
         NoSpeedDuplexProperty = "Adapter '{0}' has no 'Speed & Duplex' property - the driver does not support forcing the speed."
         NoNonAutoValues       = "Property '{0}' has no values other than auto-negotiation - forcing is not possible."
         AlreadyMax            = "Property '{0}' is already set to the maximum value '{1}' - forcing is not required."
@@ -112,6 +120,34 @@ function Write-Log {
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Write-Host $line
     Add-Content -Path $LogPath -Value $line
+}
+
+function Invoke-WithTimeout {
+    # Выполняет $ScriptBlock в отдельном runspace и ждёт не дольше $TimeoutSeconds.
+    # Нужно потому, что Get-NetAdapter/Restart-NetAdapter обращаются к
+    # WMI-провайдеру сетевого адаптера, а тот иногда перестаёт отвечать
+    # после серии быстрых перезапусков адаптера - обычный вызов в этом
+    # случае блокируется навсегда без исключения, и цикл мониторинга
+    # молча "зависает" без единой новой записи в логе.
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList = @(),
+        [int]$TimeoutSeconds = $CmdletTimeoutSeconds
+    )
+    $ps = [PowerShell]::Create()
+    try {
+        $ps.AddScript($ScriptBlock) | Out-Null
+        foreach ($arg in $ArgumentList) { $ps.AddArgument($arg) | Out-Null }
+        $asyncResult = $ps.BeginInvoke()
+        if (-not $asyncResult.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))) {
+            $ps.Stop() | Out-Null
+            throw (Get-Msg 'CmdletTimeout' @($TimeoutSeconds))
+        }
+        return $ps.EndInvoke($asyncResult)
+    }
+    finally {
+        $ps.Dispose()
+    }
 }
 
 function Test-IsAdministrator {
@@ -217,7 +253,8 @@ $lastResetTime = [datetime]::MinValue
 
 while ($true) {
     try {
-        $nic = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
+        $nic = Invoke-WithTimeout -ScriptBlock { param($Name) Get-NetAdapter -Name $Name -ErrorAction Stop } -ArgumentList @($AdapterName) |
+            Select-Object -First 1
 
         if ($nic.Status -ne 'Up') {
             Write-Log (Get-Msg 'AdapterNotUp' @($AdapterName, $nic.Status))
@@ -242,17 +279,19 @@ while ($true) {
                 else {
                     Write-Log (Get-Msg 'RestartingAdapter' @($AdapterName))
                     try {
-                        Restart-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction Stop
+                        Invoke-WithTimeout -ScriptBlock { param($Name) Restart-NetAdapter -Name $Name -Confirm:$false -ErrorAction Stop } -ArgumentList @($AdapterName) | Out-Null
                         $lastResetTime = Get-Date
                         Start-Sleep -Seconds 5
-                        $nicAfter = Get-NetAdapter -Name $AdapterName
+                        $nicAfter = Invoke-WithTimeout -ScriptBlock { param($Name) Get-NetAdapter -Name $Name } -ArgumentList @($AdapterName) |
+                            Select-Object -First 1
                         Write-Log (Get-Msg 'AfterRestart' @($nicAfter.LinkSpeed, $nicAfter.Status))
 
                         if ($ForceGigabit -and [uint64]$nicAfter.Speed -lt $MinSpeedBps) {
                             Write-Log (Get-Msg 'StillBelowThreshold')
                             if (Set-ForcedGigabitSpeed -AdapterName $AdapterName) {
                                 Start-Sleep -Seconds 5
-                                $nicForced = Get-NetAdapter -Name $AdapterName
+                                $nicForced = Invoke-WithTimeout -ScriptBlock { param($Name) Get-NetAdapter -Name $Name } -ArgumentList @($AdapterName) |
+                                    Select-Object -First 1
                                 Write-Log (Get-Msg 'AfterForcedSet' @($nicForced.LinkSpeed, $nicForced.Status))
                             }
                         }

@@ -40,6 +40,7 @@ By default, the script auto-selects the fastest active, physical, wired Ethernet
 | `-CooldownSeconds` | `90` | Minimum time between adapter restarts, in seconds, to prevent repeated restarts. |
 | `-ForceGigabit` | `$true` | If the speed is still below the threshold after a restart, force the "Speed & Duplex" property to its highest value instead of auto-negotiation. |
 | `-LogPath` | `1gbEthernetSpeedMonitor.log` next to the script | Path to the log file. |
+| `-CmdletTimeoutSeconds` | `20` | Timeout for each `Get-NetAdapter`/`Restart-NetAdapter` call. If the adapter's WMI provider stops responding (which can happen after several rapid restarts), the call is aborted after this many seconds instead of blocking the monitoring loop forever, and the attempt is retried on the next iteration. |
 
 ### Example
 
@@ -73,3 +74,4 @@ By default, the script auto-selects the fastest active, physical, wired Ethernet
 - The script reads/sets the adapter's "Speed & Duplex" property by its registry keyword (`*SpeedDuplex`) rather than by localized display name, since display text is language-dependent while the underlying codes are not.
 - Log entries are timestamped and written both to the console and to the log file specified by `-LogPath`.
 - The log language is picked once at startup based on `Get-UICulture` and does not change while the script is running.
+- Every `Get-NetAdapter`/`Restart-NetAdapter` call runs with a timeout (`-CmdletTimeoutSeconds`, default 20s) so that a stuck adapter WMI provider cannot silently hang the whole monitoring loop — it will log a timeout message and retry on the next cycle instead.
